@@ -19,7 +19,9 @@ kailua-cli validate \
   --op-node-url [YOUR_OP_NODE_URL] \
   --kailua-host [YOUR_KAILUA_HOST_BINARY_PATH] \
   --validator-key [YOUR_PROPOSER_WALLET_PRIVATE_KEY] \
-  --payout-recipient-address [YOUR_FAULT_PROOF_PAYOUT_RECIPIENT]
+  --payout-recipient-address [YOUR_FAULT_PROOF_PAYOUT_RECIPIENT] \
+  --txn-timeout [YOUR_TRANSACTION_TIMEOUT_SECONDS] \
+  --exec-gas-premium [YOUR_EXECUTION_GAS_PREMIUM_PERCENTAGE]
 ```
 
 ```admonish tip
@@ -56,6 +58,13 @@ from delaying the finality of honest sequencing proposals.
 Running `kailua-cli validate` should monitor your rollup for any disputes and generate the required proofs!
 ```
 
+### Transactions
+You can control transaction publication through the two following parameters:
+* `txn-timeout`: A timeout in seconds for transaction broadcast (default 120)
+* `exec-gas-premium`: An added premium percentage to estimated execution gas fees (Default 25)
+
+The premium parameter increases the internally estimated fees by the specified percentage.
+
 ### Upgrades
 If you re-deploy the KailuaTreasury/KailuaGame contracts to upgrade your fault proof system, you will need to restart
 your validator (and proposer).
@@ -85,7 +94,7 @@ is made by an honest proposer!
 ```
 
 ## Delegated Proof Generation
-Several extra parameters and environment variables can be specified to determine exactly where the RISC Zero proof
+Extra parameters and environment variables can be specified to determine exactly where the RISC Zero proof
 generation takes place.
 Running using only the parameters above will generate proofs using the local RISC Zero prover available to the validator.
 Alternatively, proof generation can be delegated to an external service such as [Bonsai](https://risczero.com/bonsai),
@@ -114,32 +123,10 @@ your validator to settle a dispute.
 This functionality requires some additional parameters when starting the validator.
 These parameters can be passed in as CLI arguments or set as environment variables
 
-#### Proof Requests
-The following first set of parameters determine where/how requests are made:
-* `boundless-rpc-url`: The rpc endpoint of the L1 chain where the Boundless network is deployed.
-* `boundless-wallet-key`: The wallet private key to use to send proof request transactions.
-* `boundless-offchain`: (Optional) Flag instructing whether to submit proofs off-chain.
-* `boundless-order-stream-url`: (Optional) The URL to use for off-chain order submission.
-* `boundless-set-verifier-address`: The address of the RISC Zero verifier supporting aggregated proofs for order validation.
-* `boundless-market-address`: The address of the Boundless market contract.
-* `boundless-lookback`: (Defaults to `5`) The number of previous proof requests to inspect for duplicates before making a new proof request.
-
-#### Storage Provider
-The below second set of parameters determine where the proven executable and its input are stored:
-* `storage-provider`: One of `s3`, `pinata`, or `file`.
-* `s3-access-key`: The `s3` access key.
-* `s3-secret-key`: The `s3` secret key.
-* `s3-bucket`: The `s3` bucket.
-* `s3-url`: The `s3` url.
-* `aws-region`: The `s3` region.
-* `pinata-jwt`: The private `pinata` jwt.
-* `pinata-api-url`: The `pinata` api URL.
-* `ipfs-gateway-url`: The `pinata` gateway URL.
-* `file-path`: The file storage provider path.
-
-```admonish success
-Running `kailua-cli validate` with the above extra arguments should now delegate all validator proving to the [Boundless proving network](https://docs.beboundless.xyz/)!
+```admonish todo
+Boundless support has been temporarily removed and will be reintegrated.
 ```
+
 
 ## Advanced Settings
 
@@ -148,7 +135,7 @@ Fault/Validity proof generation can be fine-tuned via the two following environm
 * `NUM_CONCURRENT_PREFLIGHTS`: (default 4) Sets the number of concurrent data preflights per proving task.
 * `NUM_CONCURRENT_PROOFS`: (default 1) Sets the number of concurrent proofs to seek per proving task.
 * `SEGMENT_LIMIT`: The [segment size limit](https://docs.rs/risc0-zkvm/1.2.3/risc0_zkvm/struct.ExecutorEnvBuilder.html#method.segment_limit_po2) used for local proving (Default 21).
-* `MAX_WITNESS_SIZE`: The maximum input size per single proof (Default 100MB).
+* `MAX_WITNESS_SIZE`: The maximum input size per single proof (Default 2.5GB).
 
 When manually computing individual proofs, the following parameters (or equiv. env. vars) take effect:
 * `SKIP_DERIVATION_PROOF`: Skips provably deriving L2 transactions using L1 data.

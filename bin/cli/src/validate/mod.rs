@@ -18,21 +18,22 @@ use crate::channel::DuplexChannel;
 use crate::db::config::Config;
 use crate::db::proposal::Proposal;
 use crate::db::KailuaDB;
-use crate::provider::{get_block_by_number, get_next_block, BlobProvider};
-use crate::signer::ValidatorSignerArgs;
-use crate::transact::Transact;
-use crate::validate::proving::{create_proving_args, Task};
+use crate::transact::blob::BlobProvider;
+use crate::transact::provider::SafeProvider;
+use crate::transact::rpc::{get_block_by_number, get_next_block};
+use crate::transact::signer::ValidatorSignerArgs;
+use crate::transact::{Transact, TransactArgs};
+use crate::validate::proving::{create_proving_args, encode_seal, Task};
 use crate::{retry_with_context, stall::Stall, CoreArgs, KAILUA_GAME_TYPE};
 use alloy::eips::eip4844::IndexedBlobHash;
 use alloy::network::primitives::HeaderResponse;
-use alloy::network::BlockResponse;
+use alloy::network::{BlockResponse, Ethereum};
 use alloy::primitives::{Address, Bytes, FixedBytes, B256};
-use alloy::providers::{ProviderBuilder, RootProvider};
+use alloy::providers::RootProvider;
 use anyhow::{anyhow, bail, Context};
 use kailua_build::KAILUA_FPVM_ID;
 use kailua_client::args::parse_address;
-use kailua_client::boundless::BoundlessArgs;
-use kailua_client::proof::{encode_seal, proof_file_name, read_proof_file};
+use kailua_client::proof::{proof_file_name, read_proof_file};
 use kailua_client::provider::OpNodeProvider;
 use kailua_client::telemetry::TelemetryArgs;
 use kailua_client::{await_tel, await_tel_res};
@@ -41,14 +42,14 @@ use kailua_common::blobs::BlobFetchRequest;
 use kailua_common::config::config_hash;
 use kailua_common::journal::ProofJournal;
 use kailua_common::precondition::{equivalence_precondition_hash, PreconditionValidationData};
-use kailua_common::proof::Proof;
 use kailua_contracts::*;
 use kailua_host::channel::AsyncChannel;
 use kailua_host::config::fetch_rollup_config;
 use kona_protocol::BlockInfo;
-use opentelemetry::global::tracer;
+use opentelemetry::global::{meter, tracer};
 use opentelemetry::trace::{FutureExt, TraceContextExt, Tracer};
-use risc0_zkvm::is_dev_mode;
+use opentelemetry::KeyValue;
+use risc0_zkvm::{is_dev_mode, Receipt};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::exit;
@@ -77,15 +78,15 @@ pub struct ValidateArgs {
     /// Secret key of L1 wallet to use for challenging and proving outputs
     #[clap(flatten)]
     pub validator_signer: ValidatorSignerArgs,
+    /// Transaction publication configuration
+    #[clap(flatten)]
+    pub txn_args: TransactArgs,
     /// Address of the recipient account to use for bond payouts
     #[clap(long, env, value_parser = parse_address)]
     pub payout_recipient_address: Option<Address>,
     /// Address of the KailuaGame implementation to use
     #[clap(long, env, value_parser = parse_address)]
     pub kailua_game_implementation: Option<Address>,
-
-    #[clap(flatten)]
-    pub boundless: BoundlessArgs,
 
     #[clap(flatten)]
     pub telemetry: TelemetryArgs,
@@ -126,7 +127,7 @@ pub enum Message {
         claimed_l2_block_number: u64,
         claimed_l2_output_root: FixedBytes<32>,
     },
-    Proof(u64, Proof),
+    Proof(u64, Receipt),
 }
 
 pub async fn handle_proposals(
@@ -134,6 +135,21 @@ pub async fn handle_proposals(
     args: ValidateArgs,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    // Telemetry
+    let meter = meter("kailua");
+    let meter_fault_count = meter.u64_counter("validator.fault.count").build();
+    let meter_fault_latest = meter.u64_gauge("validator.fault.latest").build();
+    let meter_correct_count = meter.u64_counter("validator.correct.count").build();
+    let meter_correct_latest = meter.u64_gauge("validator.correct.latest").build();
+    let meter_skipped_count = meter.u64_counter("validator.skipped.count").build();
+    let meter_skipped_latest = meter.u64_gauge("validator.skipped.latest").build();
+    let meter_sync_canonical = meter.u64_gauge("validator.sync.canonical").build();
+    let meter_sync_next = meter.u64_gauge("validator.sync.next").build();
+    let meter_proofs_requested = meter.u64_counter("validator.proofs.requested").build();
+    let meter_proofs_completed = meter.u64_counter("validator.proofs.complete").build();
+    let meter_proofs_published = meter.u64_counter("validator.proofs.published").build();
+    let meter_proofs_fail = meter.u64_counter("validator.proofs.errs").build();
+    let meter_proofs_discarded = meter.u64_counter("validator.proofs.discarded").build();
     let tracer = tracer("kailua");
     let context = opentelemetry::Context::current_with_span(tracer.start("handle_proposals"));
 
@@ -162,8 +178,7 @@ pub async fn handle_proposals(
     let dgf_address = system_config
         .disputeGameFactory()
         .stall_with_context(context.clone(), "SystemConfig::disputeGameFactory")
-        .await
-        .addr_;
+        .await;
 
     // initialize validator wallet
     info!("Initializing validator wallet.");
@@ -174,19 +189,21 @@ pub async fn handle_proposals(
         args.validator_signer.wallet(Some(config.l1_chain_id))
     )?;
     let validator_address = validator_wallet.default_signer().address();
-    let validator_provider = ProviderBuilder::new()
-        .wallet(validator_wallet)
-        .on_http(args.core.eth_rpc_url.as_str().try_into()?);
+    let validator_provider = SafeProvider::new(
+        args.txn_args
+            .premium_provider::<Ethereum>()
+            .wallet(validator_wallet)
+            .connect_http(args.core.eth_rpc_url.as_str().try_into()?),
+    );
     info!("Validator address: {validator_address}");
 
     // Init factory contract
-    let dispute_game_factory = IDisputeGameFactory::new(dgf_address, &validator_provider);
+    let dispute_game_factory = IDisputeGameFactory::new(dgf_address, &eth_rpc_provider);
     info!("DisputeGameFactory({:?})", dispute_game_factory.address());
     let game_count: u64 = dispute_game_factory
         .gameCount()
         .stall_with_context(context.clone(), "DisputeGameFactory::gameCount")
         .await
-        .gameCount_
         .to();
     info!("There have been {game_count} games created using DisputeGameFactory");
 
@@ -194,8 +211,7 @@ pub async fn handle_proposals(
     let latest_game_impl_addr = dispute_game_factory
         .gameImpls(KAILUA_GAME_TYPE)
         .stall_with_context(context.clone(), "DisputeGameFactory::gameImpls")
-        .await
-        .impl_;
+        .await;
     let kailua_game_implementation_address = args
         .kailua_game_implementation
         .unwrap_or(latest_game_impl_addr);
@@ -206,7 +222,7 @@ pub async fn handle_proposals(
     }
 
     let kailua_game_implementation =
-        KailuaGame::new(kailua_game_implementation_address, &validator_provider);
+        KailuaGame::new(kailua_game_implementation_address, &eth_rpc_provider);
     info!("KailuaGame({:?})", kailua_game_implementation.address());
     if kailua_game_implementation.address().is_zero() {
         error!("Fault proof game is not installed!");
@@ -244,6 +260,18 @@ pub async fn handle_proposals(
         )
         .context("load_proposals")?;
 
+        // Update sync telemetry
+        if let Some(canonical_tip) = kailua_db.canonical_tip() {
+            meter_sync_canonical.record(
+                canonical_tip.index,
+                &[
+                    KeyValue::new("proposal", canonical_tip.contract.to_string()),
+                    KeyValue::new("l2_height", canonical_tip.output_block_number.to_string()),
+                ],
+            );
+        };
+        meter_sync_next.record(kailua_db.state.next_factory_index, &[]);
+
         // check new proposals for fault and queue potential responses
         for proposal_index in loaded_proposals {
             let Some(proposal) = kailua_db.get_local_proposal(&proposal_index) else {
@@ -255,6 +283,38 @@ pub async fn handle_proposals(
                 info!("Skipping proving for treasury instance.");
                 continue;
             }
+            // Telemetry
+            if proposal.is_correct().unwrap_or_default() {
+                meter_correct_count.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                    ],
+                );
+                meter_correct_latest.record(
+                    proposal.index,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                    ],
+                );
+            } else {
+                meter_fault_count.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                    ],
+                );
+                meter_fault_latest.record(
+                    proposal.index,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                    ],
+                );
+            }
             // Look up parent proposal
             let Some(parent) = kailua_db.get_local_proposal(&proposal.parent) else {
                 error!(
@@ -263,17 +323,33 @@ pub async fn handle_proposals(
                 );
                 continue;
             };
-            let parent_contract = parent.tournament_contract_instance(&validator_provider);
+            let parent_contract = parent.tournament_contract_instance(&eth_rpc_provider);
             // Check that a validity proof has not already been posted
             let is_validity_proven = await_tel!(
                 context,
-                parent.fetch_is_successor_validity_proven(&validator_provider)
+                parent.fetch_is_successor_validity_proven(&eth_rpc_provider)
             )
             .context("is_validity_proven")?;
             if is_validity_proven {
                 info!(
                     "Validity proof settling all disputes in tournament {} already submitted",
                     parent.index
+                );
+                meter_skipped_count.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("tournament", parent.contract.to_string()),
+                        KeyValue::new("reason", "parent_successor_proven"),
+                    ],
+                );
+                meter_skipped_latest.record(
+                    proposal.index,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("tournament", parent.contract.to_string()),
+                        KeyValue::new("reason", "parent_successor_proven"),
+                    ],
                 );
                 continue;
             }
@@ -314,11 +390,14 @@ pub async fn handle_proposals(
                                 error!("Proposal {p} missing from database.");
                                 return false;
                             };
-                            let invalid_predecessor = predecessor.is_correct() == Some(false);
-                            if invalid_predecessor {
-                                info!("Found invalid predecessor proposal {p}");
+                            if kailua_db.was_proposer_eliminated_before(&predecessor) {
+                                return false;
                             }
-                            invalid_predecessor
+                            if predecessor.is_correct().unwrap_or_default() {
+                                return false;
+                            }
+                            info!("Found invalid predecessor proposal {p}");
+                            true
                         });
                 // Check canonical proposal status
                 match parent.successor {
@@ -370,11 +449,14 @@ pub async fn handle_proposals(
                             error!("Proposal {p} missing from database.");
                             return false;
                         };
-                        let duplicate_predecessor = predecessor.signature == proposal.signature;
-                        if duplicate_predecessor {
-                            info!("Found duplicate predecessor proposal {p}");
+                        if kailua_db.was_proposer_eliminated_before(&predecessor) {
+                            return false;
                         }
-                        duplicate_predecessor
+                        if predecessor.signature != proposal.signature {
+                            return false;
+                        }
+                        info!("Found duplicate predecessor proposal {p}");
+                        true
                     });
             if is_repeat_signature {
                 info!(
@@ -397,12 +479,27 @@ pub async fn handle_proposals(
             let proof_status = parent_contract
                 .proofStatus(proposal.signature)
                 .stall_with_context(context.clone(), "KailuaTournament::proofStatus")
-                .await
-                ._0;
+                .await;
             if proof_status != 0 {
                 info!(
                     "Proposal {} signature {} already proven {proof_status}",
                     proposal.index, proposal.signature
+                );
+                meter_skipped_count.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("tournament", parent.contract.to_string()),
+                        KeyValue::new("reason", "proof_status"),
+                    ],
+                );
+                meter_skipped_latest.record(
+                    proposal.index,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("tournament", parent.contract.to_string()),
+                        KeyValue::new("reason", "proof_status"),
+                    ],
                 );
                 continue;
             }
@@ -454,6 +551,14 @@ pub async fn handle_proposals(
             ) {
                 error!("Could not request fault proof for {proposal_index}: {err:?}");
                 output_fault_buffer.push_back(proposal_index);
+            } else {
+                meter_proofs_requested.add(
+                    1,
+                    &[
+                        KeyValue::new("type", "fault"),
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                    ],
+                );
             }
         }
         // dispatch buffered validity proof requests
@@ -475,13 +580,12 @@ pub async fn handle_proposals(
                 continue;
             };
 
-            let parent_contract = parent.tournament_contract_instance(&validator_provider);
+            let parent_contract = parent.tournament_contract_instance(&eth_rpc_provider);
             // Check that a validity proof had not already been posted
             let proof_status = parent_contract
                 .proofStatus(proposal.signature)
                 .stall_with_context(context.clone(), "KailuaTournament::proofStatus")
-                .await
-                ._0;
+                .await;
             if proof_status != 0 {
                 info!(
                     "Proposal {} signature {} already proven {proof_status}",
@@ -503,6 +607,14 @@ pub async fn handle_proposals(
             ) {
                 error!("Could not request validity proof for {proposal_index}: {err:?}");
                 valid_buffer.push_front(proposal_index);
+            } else {
+                meter_proofs_requested.add(
+                    1,
+                    &[
+                        KeyValue::new("type", "validity"),
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                    ],
+                );
             }
         }
 
@@ -512,35 +624,44 @@ pub async fn handle_proposals(
                 error!("Proofs receiver channel closed");
                 break;
             };
+            meter_proofs_completed.add(1, &[]);
             output_fault_proof_buffer.push_back(message);
         }
 
         // publish computed output fault proofs
         let computed_proofs = output_fault_proof_buffer.len();
         for _ in 0..computed_proofs {
-            let Some(Message::Proof(proposal_index, proof)) = output_fault_proof_buffer.pop_front()
+            let Some(Message::Proof(proposal_index, receipt)) =
+                output_fault_proof_buffer.pop_front()
             else {
                 error!("Validator loop received an unexpected message.");
                 continue;
             };
             let Some(proposal) = kailua_db.get_local_proposal(&proposal_index) else {
                 error!("Proposal {proposal_index} missing from database.");
-                output_fault_proof_buffer.push_back(Message::Proof(proposal_index, proof));
+                output_fault_proof_buffer.push_back(Message::Proof(proposal_index, receipt));
                 continue;
             };
             let Some(parent) = kailua_db.get_local_proposal(&proposal.parent) else {
                 error!("Parent proposal {} missing from database.", proposal.parent);
-                output_fault_proof_buffer.push_back(Message::Proof(proposal_index, proof));
+                output_fault_proof_buffer.push_back(Message::Proof(proposal_index, receipt));
                 continue;
             };
             // Abort early if a validity proof is already submitted in this tournament
             if await_tel!(
                 context,
-                parent.fetch_is_successor_validity_proven(&validator_provider)
+                parent.fetch_is_successor_validity_proven(&eth_rpc_provider)
             )? {
                 info!(
                     "Skipping proof submission in tournament {} with validity proof.",
                     parent.index
+                );
+                meter_proofs_discarded.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("reason", "redundant"),
+                    ],
                 );
                 continue;
             }
@@ -549,33 +670,26 @@ pub async fn handle_proposals(
                 .FPVM_IMAGE_ID()
                 .stall_with_context(context.clone(), "KailuaTournament::FPVM_IMAGE_ID")
                 .await
-                ._0
                 .0;
             // patch the proof if in dev mode
             #[cfg(feature = "devnet")]
-            let proof = proving::maybe_patch_proof(
-                proof,
-                expected_fpvm_image_id,
-                kailua_common::config::SET_BUILDER_ID.0,
-            )?;
+            let receipt = proving::maybe_patch_proof(receipt, expected_fpvm_image_id)?;
             // verify that the zkvm receipt is valid
-            if let Some(receipt) = proof.as_zkvm_receipt() {
-                if let Err(e) = receipt.verify(expected_fpvm_image_id) {
-                    error!("Could not verify receipt against image id in contract: {e:?}");
-                } else {
-                    info!("Receipt validated.");
-                }
+            if let Err(e) = receipt.verify(expected_fpvm_image_id) {
+                error!("Could not verify receipt against image id in contract: {e:?}");
+            } else {
+                info!("Receipt validated.");
             }
             // Decode ProofJournal
-            let proof_journal = ProofJournal::decode_packed(proof.journal().as_ref())?;
+            let proof_journal = ProofJournal::decode_packed(receipt.journal.as_ref())?;
             info!("Proof journal: {:?}", proof_journal);
             // encode seal data
-            let encoded_seal = Bytes::from(encode_seal(&proof)?);
+            let encoded_seal = Bytes::from(encode_seal(&receipt)?);
 
             let child_index = parent
                 .child_index(proposal.index)
                 .expect("Could not look up proposal's index in parent tournament");
-            let proposal_contract = proposal.tournament_contract_instance(&validator_provider);
+            let proposal_contract = proposal.tournament_contract_instance(&eth_rpc_provider);
             // Check if proof is a viable validity proof
             if proof_journal.l1_head == proposal.l1_head
                 && proof_journal.agreed_l2_output_root == parent.output_root
@@ -591,8 +705,7 @@ pub async fn handle_proposals(
                     let contract_blobs_hash = proposal_contract
                         .blobsHash()
                         .stall_with_context(context.clone(), "KailuaGame::blobsHash")
-                        .await
-                        .blobsHash_;
+                        .await;
                     if proposal.blobs_hash() != contract_blobs_hash {
                         warn!(
                             "Local proposal blobs hash {} doesn't match contract blobs hash {}",
@@ -619,8 +732,7 @@ pub async fn handle_proposals(
                     let config_hash = proposal_contract
                         .ROLLUP_CONFIG_HASH()
                         .stall_with_context(context.clone(), "KailuaGame::ROLLUP_CONFIG_HASH")
-                        .await
-                        ._0;
+                        .await;
                     if proof_journal.config_hash != config_hash {
                         warn!(
                             "Proof config hash {} does not match contract hash {config_hash}",
@@ -666,14 +778,54 @@ pub async fn handle_proposals(
                         let proof_status = parent_contract
                             .provenAt(proposal.signature)
                             .stall_with_context(context.clone(), "KailuaTournament::provenAt")
-                            .await
-                            ._0;
+                            .await;
                         info!("Validity proof timestamp: {proof_status}");
                         info!("KailuaTournament::proveValidity: {} gas", receipt.gas_used);
+
+                        meter_proofs_published.add(
+                            1,
+                            &[
+                                KeyValue::new("type", "validity"),
+                                KeyValue::new("proposal", proposal.contract.to_string()),
+                                KeyValue::new(
+                                    "l2_height",
+                                    proposal.output_block_number.to_string(),
+                                ),
+                                KeyValue::new("txn_hash", receipt.transaction_hash.to_string()),
+                                KeyValue::new("txn_from", receipt.from.to_string()),
+                                KeyValue::new("txn_to", receipt.to.unwrap_or_default().to_string()),
+                                KeyValue::new("txn_gas_used", receipt.gas_used.to_string()),
+                                KeyValue::new(
+                                    "txn_gas_price",
+                                    receipt.effective_gas_price.to_string(),
+                                ),
+                                KeyValue::new(
+                                    "txn_blob_gas_used",
+                                    receipt.blob_gas_used.unwrap_or_default().to_string(),
+                                ),
+                                KeyValue::new(
+                                    "txn_blob_gas_price",
+                                    receipt.blob_gas_price.unwrap_or_default().to_string(),
+                                ),
+                            ],
+                        );
                     }
                     Err(e) => {
                         error!("Failed to confirm validity proof txn: {e:?}");
-                        output_fault_proof_buffer.push_back(Message::Proof(proposal_index, proof));
+                        meter_proofs_fail.add(
+                            1,
+                            &[
+                                KeyValue::new("type", "validity"),
+                                KeyValue::new("proposal", proposal.contract.to_string()),
+                                KeyValue::new(
+                                    "l2_height",
+                                    proposal.output_block_number.to_string(),
+                                ),
+                                KeyValue::new("msg", e.to_string()),
+                            ],
+                        );
+                        output_fault_proof_buffer
+                            .push_back(Message::Proof(proposal_index, receipt));
                     }
                 }
                 // Skip fault proof submission logic
@@ -683,6 +835,13 @@ pub async fn handle_proposals(
             // The index of the non-zero intermediate output to challenge
             let Some(fault) = proposal.fault() else {
                 error!("Attempted output proof for correct proposal!");
+                meter_proofs_discarded.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("reason", "unfalsifiable"),
+                    ],
+                );
                 continue;
             };
             if !fault.is_output() {
@@ -746,10 +905,16 @@ pub async fn handle_proposals(
             let fault_proof_status = parent_contract
                 .proofStatus(proposal.signature)
                 .stall_with_context(context.clone(), "KailuaTournament::proofStatus")
-                .await
-                ._0;
+                .await;
             if fault_proof_status != 0 {
                 warn!("Skipping proof submission for already proven game at local index {proposal_index}.");
+                meter_proofs_discarded.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("reason", "proven"),
+                    ],
+                );
                 continue;
             } else {
                 info!("Fault proof status: {fault_proof_status}");
@@ -793,8 +958,7 @@ pub async fn handle_proposals(
                             proofs.last().unwrap().clone(),
                         )
                         .stall_with_context(context.clone(), "KailuaGame::verifyIntermediateOutput")
-                        .await
-                        .success;
+                        .await;
                     if !proposal_has_output {
                         warn!("Could not verify proposed output");
                     } else {
@@ -827,8 +991,7 @@ pub async fn handle_proposals(
                             proofs.first().unwrap().clone(),
                         )
                         .stall_with_context(context.clone(), "KailuaGame::verifyIntermediateOutput")
-                        .await
-                        .success;
+                        .await;
                     if !proposal_has_output {
                         warn!("Could not verify last common output for proposal");
                     } else {
@@ -862,8 +1025,7 @@ pub async fn handle_proposals(
                 let config_hash = parent_contract
                     .ROLLUP_CONFIG_HASH()
                     .stall_with_context(context.clone(), "KailuaTournament::ROLLUP_CONFIG_HASH")
-                    .await
-                    ._0;
+                    .await;
                 if proof_journal.config_hash != config_hash {
                     warn!(
                         "Config hash mismatch. Found {}, expected {config_hash}.",
@@ -902,18 +1064,47 @@ pub async fn handle_proposals(
                     let proof_status = parent_contract
                         .proofStatus(proposal.signature)
                         .stall_with_context(context.clone(), "KailuaTournament::proofStatus")
-                        .await
-                        ._0;
+                        .await;
                     info!("Proposal {} proven: {proof_status}", proposal.index);
-
                     info!(
                         "KailuaTournament::proveOutputFault: {} gas",
                         receipt.gas_used
                     );
+
+                    meter_proofs_published.add(
+                        1,
+                        &[
+                            KeyValue::new("type", "fault_output"),
+                            KeyValue::new("proposal", proposal.contract.to_string()),
+                            KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                            KeyValue::new("txn_hash", receipt.transaction_hash.to_string()),
+                            KeyValue::new("txn_from", receipt.from.to_string()),
+                            KeyValue::new("txn_to", receipt.to.unwrap_or_default().to_string()),
+                            KeyValue::new("txn_gas_used", receipt.gas_used.to_string()),
+                            KeyValue::new("txn_gas_price", receipt.effective_gas_price.to_string()),
+                            KeyValue::new(
+                                "txn_blob_gas_used",
+                                receipt.blob_gas_used.unwrap_or_default().to_string(),
+                            ),
+                            KeyValue::new(
+                                "txn_blob_gas_price",
+                                receipt.blob_gas_price.unwrap_or_default().to_string(),
+                            ),
+                        ],
+                    );
                 }
                 Err(e) => {
                     error!("Failed to confirm fault proof txn: {e:?}");
-                    output_fault_proof_buffer.push_back(Message::Proof(proposal_index, proof));
+                    meter_proofs_fail.add(
+                        1,
+                        &[
+                            KeyValue::new("type", "fault_output"),
+                            KeyValue::new("proposal", proposal.contract.to_string()),
+                            KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                            KeyValue::new("msg", e.to_string()),
+                        ],
+                    );
+                    output_fault_proof_buffer.push_back(Message::Proof(proposal_index, receipt));
                 }
             }
         }
@@ -927,7 +1118,7 @@ pub async fn handle_proposals(
                 null_fault_buffer.push_back(proposal_index);
                 continue;
             };
-            let proposal_contract = proposal.tournament_contract_instance(&validator_provider);
+            let proposal_contract = proposal.tournament_contract_instance(&eth_rpc_provider);
             // Fetch proposal parent from db
             let Some(parent) = kailua_db.get_local_proposal(&proposal.parent) else {
                 error!("Parent proposal {} missing from database.", proposal.parent);
@@ -938,6 +1129,13 @@ pub async fn handle_proposals(
 
             let Some(fault) = proposal.fault() else {
                 error!("Attempted null proof for correct proposal!");
+                meter_proofs_discarded.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("reason", "unfalsifiable"),
+                    ],
+                );
                 continue;
             };
             if !fault.is_null() {
@@ -962,10 +1160,16 @@ pub async fn handle_proposals(
             let fault_proof_status = parent_contract
                 .proofStatus(proposal.signature)
                 .stall_with_context(context.clone(), "KailuaTournament::proofStatus")
-                .await
-                ._0;
+                .await;
             if fault_proof_status != 0 {
                 warn!("Skipping proof submission for already proven game at local index {proposal_index}.");
+                meter_proofs_discarded.add(
+                    1,
+                    &[
+                        KeyValue::new("proposal", proposal.contract.to_string()),
+                        KeyValue::new("reason", "proven"),
+                    ],
+                );
                 continue;
             } else {
                 info!("Fault proof status: {fault_proof_status}");
@@ -986,7 +1190,6 @@ pub async fn handle_proposals(
                     )
                     .stall_with_context(context.clone(), "KailuaGame::verifyIntermediateOutput")
                     .await
-                    .success
                 {
                     warn!("Could not verify divergent trail output for proposal");
                 } else {
@@ -1022,14 +1225,43 @@ pub async fn handle_proposals(
                     let proof_status = parent_contract
                         .proofStatus(proposal.signature)
                         .stall_with_context(context.clone(), "KailuaTournament::proofStatus")
-                        .await
-                        ._0;
+                        .await;
                     info!("Proposal {} proven: {proof_status}", proposal.index);
-
                     info!("KailuaTournament::proveNullFault: {} gas", receipt.gas_used);
+
+                    meter_proofs_published.add(
+                        1,
+                        &[
+                            KeyValue::new("type", "fault_null"),
+                            KeyValue::new("proposal", proposal.contract.to_string()),
+                            KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                            KeyValue::new("txn_hash", receipt.transaction_hash.to_string()),
+                            KeyValue::new("txn_from", receipt.from.to_string()),
+                            KeyValue::new("txn_to", receipt.to.unwrap_or_default().to_string()),
+                            KeyValue::new("txn_gas_used", receipt.gas_used.to_string()),
+                            KeyValue::new("txn_gas_price", receipt.effective_gas_price.to_string()),
+                            KeyValue::new(
+                                "txn_blob_gas_used",
+                                receipt.blob_gas_used.unwrap_or_default().to_string(),
+                            ),
+                            KeyValue::new(
+                                "txn_blob_gas_price",
+                                receipt.blob_gas_price.unwrap_or_default().to_string(),
+                            ),
+                        ],
+                    );
                 }
                 Err(e) => {
                     error!("Failed to confirm fault proof txn: {e:?}");
+                    meter_proofs_fail.add(
+                        1,
+                        &[
+                            KeyValue::new("type", "fault_null"),
+                            KeyValue::new("proposal", proposal.contract.to_string()),
+                            KeyValue::new("l2_height", proposal.output_block_number.to_string()),
+                            KeyValue::new("msg", e.to_string()),
+                        ],
+                    );
                     null_fault_buffer.push_back(proposal_index);
                 }
             }
@@ -1180,6 +1412,7 @@ pub async fn handle_proof_requests(
     args: ValidateArgs,
     data_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    // Telemetry
     let tracer = tracer("kailua");
     let context = opentelemetry::Context::current_with_span(tracer.start("handle_proof_requests"));
 

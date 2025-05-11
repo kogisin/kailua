@@ -1,4 +1,4 @@
-// Copyright 2024 RISC Zero, Inc.
+// Copyright 2024, 2025 RISC Zero, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 pragma solidity ^0.8.24;
 
 import "./vendor/FlatOPImportV1.4.0.sol";
-import "./vendor/FlatR0ImportV1.2.0.sol";
+import "./vendor/FlatR0ImportV2.0.2.sol";
 import "./KailuaLib.sol";
 import "./KailuaTournament.sol";
 import "./KailuaTreasury.sol";
@@ -43,44 +43,27 @@ contract KailuaGame is KailuaTournament {
     uint256 public immutable PROPOSAL_TIME_GAP;
 
     constructor(
-        IKailuaTreasury _kailuaTreasury,
-        IRiscZeroVerifier _verifierContract,
-        bytes32 _imageId,
-        bytes32 _configHash,
-        uint256 _proposalOutputCount,
-        uint256 _outputBlockSpan,
-        GameType _gameType,
-        IDisputeGameFactory _disputeGameFactory,
+        KailuaTreasury _kailuaTreasury,
         uint256 _genesisTimeStamp,
         uint256 _l2BlockTime,
         uint256 _proposalTimeGap,
         Duration _maxClockDuration
     )
         KailuaTournament(
-            _kailuaTreasury,
-            _verifierContract,
-            _imageId,
-            _configHash,
-            _proposalOutputCount,
-            _outputBlockSpan,
-            _gameType,
-            _disputeGameFactory
+            IKailuaTreasury(address(_kailuaTreasury)),
+            _kailuaTreasury.RISC_ZERO_VERIFIER(),
+            _kailuaTreasury.FPVM_IMAGE_ID(),
+            _kailuaTreasury.ROLLUP_CONFIG_HASH(),
+            _kailuaTreasury.PROPOSAL_OUTPUT_COUNT(),
+            _kailuaTreasury.OUTPUT_BLOCK_SPAN(),
+            _kailuaTreasury.GAME_TYPE(),
+            _kailuaTreasury.OPTIMISM_PORTAL()
         )
     {
-        MAX_CLOCK_DURATION = _maxClockDuration;
         GENESIS_TIME_STAMP = _genesisTimeStamp;
         L2_BLOCK_TIME = _l2BlockTime;
         PROPOSAL_TIME_GAP = _proposalTimeGap;
-        // Require KailuaTreasury tournament config to match KailuaGame tournament config
-        KailuaTreasury treasury = KailuaTreasury(address(_kailuaTreasury));
-        require(treasury.RISC_ZERO_VERIFIER() == RISC_ZERO_VERIFIER);
-        require(treasury.FPVM_IMAGE_ID() == FPVM_IMAGE_ID);
-        require(treasury.ROLLUP_CONFIG_HASH() == ROLLUP_CONFIG_HASH);
-        require(treasury.PROPOSAL_OUTPUT_COUNT() == PROPOSAL_OUTPUT_COUNT);
-        require(treasury.OUTPUT_BLOCK_SPAN() == OUTPUT_BLOCK_SPAN);
-        require(treasury.PROPOSAL_BLOBS() == PROPOSAL_BLOBS);
-        require(treasury.GAME_TYPE().raw() == GAME_TYPE.raw());
-        require(treasury.DISPUTE_GAME_FACTORY() == DISPUTE_GAME_FACTORY);
+        MAX_CLOCK_DURATION = _maxClockDuration;
     }
 
     // ------------------------------
@@ -146,11 +129,6 @@ contract KailuaGame is KailuaTournament {
             revert ProvenFaulty();
         }
 
-        // Allow only the treasury to create new games
-        if (gameCreator() != address(KAILUA_TREASURY)) {
-            revert Blacklisted(gameCreator(), address(KAILUA_TREASURY));
-        }
-
         // Prohibit null claims
         if (rootClaim().raw() == 0x0) {
             revert UnexpectedRootClaim(rootClaim());
@@ -160,8 +138,8 @@ contract KailuaGame is KailuaTournament {
         parentGame_.appendChild();
 
         // Do not permit proposals if l2 block is still inside the proposal gap
-        if (block.timestamp <= minCreationTime().raw()) {
-            revert ClockTimeExceeded();
+        if (block.timestamp < minCreationTime().raw()) {
+            revert ProposalGapRemaining(block.timestamp, minCreationTime().raw());
         }
     }
 
@@ -226,10 +204,7 @@ contract KailuaGame is KailuaTournament {
 
     /// @inheritdoc KailuaTournament
     function parentGame() public view override returns (KailuaTournament parentGame_) {
-        (GameType parentGameType,, IDisputeGame parentDisputeGame) = DISPUTE_GAME_FACTORY.gameAtIndex(parentGameIndex());
-
-        // Only allow fault claim games to be based off of other instances of the same game type
-        if (parentGameType.raw() != GAME_TYPE.raw()) revert GameTypeMismatch(parentGameType, GAME_TYPE);
+        (,, IDisputeGame parentDisputeGame) = DISPUTE_GAME_FACTORY.gameAtIndex(parentGameIndex());
 
         // Interpret parent game as another instance of this game type
         parentGame_ = KailuaTournament(address(parentDisputeGame));
@@ -249,9 +224,13 @@ contract KailuaGame is KailuaTournament {
         uint256 blobIndex = KailuaKZGLib.blobIndex(outputNumber);
         uint32 blobPosition = KailuaKZGLib.fieldElementIndex(outputNumber);
         bytes32 proposalBlobHash = KailuaKZGLib.versionedKZGHash(blobCommitment);
-        // Note: The below check also implies that we can validate only against known blobs
-        require(proposalBlobHash == proposalBlobHashes[blobIndex].raw(), "bad proposalBlobHash");
-        success = KailuaKZGLib.verifyKZGBlobProof(proposalBlobHash, blobPosition, outputFe, blobCommitment, kzgProof);
+        // Note: Only known blobs can be used to validate an intermediate output
+        if (proposalBlobHash != proposalBlobHashes[blobIndex].raw()) {
+            success = false;
+        } else {
+            success =
+                KailuaKZGLib.verifyKZGBlobProof(proposalBlobHash, blobPosition, outputFe, blobCommitment, kzgProof);
+        }
     }
 
     /// @inheritdoc KailuaTournament

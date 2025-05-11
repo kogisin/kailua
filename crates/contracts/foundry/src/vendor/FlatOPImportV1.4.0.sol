@@ -4466,6 +4466,7 @@ error NoImplementation(GameType gameType);
 
 /// @notice Thrown when a dispute game that already exists is attempted to be created.
 /// @param uuid The UUID of the dispute game that already exists.
+// 0x014f6fe5
 error GameAlreadyExists(Hash uuid);
 
 /// @notice Thrown when the root claim has an unexpected VM status.
@@ -4500,6 +4501,7 @@ error CannotDefendRootClaim();
 error ClaimAlreadyExists();
 
 /// @notice Thrown when a disputed claim does not match its index in the game.
+// 0x30140332
 error InvalidDisputedClaimIndex();
 
 // 0x67fe1950

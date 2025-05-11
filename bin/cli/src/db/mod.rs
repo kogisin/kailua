@@ -18,8 +18,8 @@ pub mod proposal;
 pub mod state;
 pub mod treasury;
 
-use crate::provider::BlobProvider;
 use crate::stall::Stall;
+use crate::transact::blob::BlobProvider;
 use crate::KAILUA_GAME_TYPE;
 use alloy::network::Network;
 use alloy::primitives::{Address, U256};
@@ -63,7 +63,7 @@ impl KailuaDB {
 
     pub async fn init<P: Provider<N>, N: Network>(
         mut data_dir: PathBuf,
-        dispute_game_factory: &IDisputeGameFactoryInstance<(), P, N>,
+        dispute_game_factory: &IDisputeGameFactoryInstance<P, N>,
         game_implementation_address: Address,
     ) -> anyhow::Result<Self> {
         let tracer = tracer("kailua");
@@ -95,7 +95,7 @@ impl KailuaDB {
 
     pub async fn load_proposals<P: Provider<N>, N: Network>(
         &mut self,
-        dispute_game_factory: &IDisputeGameFactoryInstance<(), P, N>,
+        dispute_game_factory: &IDisputeGameFactoryInstance<P, N>,
         op_node_provider: &OpNodeProvider,
         blob_provider: &BlobProvider,
     ) -> anyhow::Result<Vec<u64>> {
@@ -108,10 +108,8 @@ impl KailuaDB {
             .gameCount()
             .stall_with_context(context.clone(), "DisputeGameFactory::gameCount")
             .await
-            .gameCount_
             .to();
-        let mut proposals =
-            Vec::with_capacity((game_count - self.state.next_factory_index) as usize);
+        let mut proposals = Vec::new();
         while self.state.next_factory_index < game_count {
             let proposal = match self.get_local_proposal(&self.state.next_factory_index) {
                 Some(proposal) => {
@@ -187,7 +185,7 @@ impl KailuaDB {
 
     pub async fn load_game_at_index<P: Provider<N>, N: Network>(
         &mut self,
-        dispute_game_factory: &IDisputeGameFactoryInstance<(), P, N>,
+        dispute_game_factory: &IDisputeGameFactoryInstance<P, N>,
         op_node_provider: &OpNodeProvider,
         blob_provider: &BlobProvider,
         index: u64,
@@ -307,7 +305,7 @@ impl KailuaDB {
             // Consider updating canonical chain tip if none exists or proposal has greater height
             if self
                 .canonical_tip_height()
-                .map_or(true, |h| h < proposal.output_block_number)
+                .is_none_or(|h| h < proposal.output_block_number)
             {
                 proposal.canonical = Some(true);
             } else {

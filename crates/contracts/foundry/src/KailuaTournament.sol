@@ -1,4 +1,4 @@
-// Copyright 2024 RISC Zero, Inc.
+// Copyright 2024, 2025 RISC Zero, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ pragma solidity ^0.8.24;
 import "./KailuaLib.sol";
 import "./vendor/FlatOPImportV1.4.0.sol";
 import "./vendor/FlatOPImportV1.4.0.sol";
-import "./vendor/FlatR0ImportV1.2.0.sol";
+import "./vendor/FlatR0ImportV2.0.2.sol";
 
 abstract contract KailuaTournament is Clone, IDisputeGame {
     // ------------------------------
@@ -49,8 +49,11 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
     /// @notice The game type ID
     GameType public immutable GAME_TYPE;
 
-    /// @notice The dispute game factory
-    IDisputeGameFactory public immutable DISPUTE_GAME_FACTORY;
+    /// @notice The OptimismPortal2 instance
+    OptimismPortal2 public immutable OPTIMISM_PORTAL;
+
+    /// @notice The DisputeGameFactory instance
+    DisputeGameFactory public immutable DISPUTE_GAME_FACTORY;
 
     constructor(
         IKailuaTreasury _kailuaTreasury,
@@ -60,7 +63,7 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
         uint256 _proposalOutputCount,
         uint256 _outputBlockSpan,
         GameType _gameType,
-        IDisputeGameFactory _disputeGameFactory
+        OptimismPortal2 _optimismPortal
     ) {
         KAILUA_TREASURY = _kailuaTreasury;
         RISC_ZERO_VERIFIER = _verifierContract;
@@ -73,12 +76,18 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
         PROPOSAL_BLOBS = (_proposalOutputCount / KailuaKZGLib.FIELD_ELEMENTS_PER_BLOB)
             + ((_proposalOutputCount % KailuaKZGLib.FIELD_ELEMENTS_PER_BLOB) == 0 ? 0 : 1);
         GAME_TYPE = _gameType;
-        DISPUTE_GAME_FACTORY = _disputeGameFactory;
+        OPTIMISM_PORTAL = _optimismPortal;
+        DISPUTE_GAME_FACTORY = OPTIMISM_PORTAL.disputeGameFactory();
     }
 
     function initializeInternal() internal {
         // INVARIANT: The game must not have already been initialized.
         if (createdAt.raw() > 0) revert AlreadyInitialized();
+
+        // Allow only the treasury to create new games
+        if (gameCreator() != address(KAILUA_TREASURY)) {
+            revert Blacklisted(gameCreator(), address(KAILUA_TREASURY));
+        }
 
         // Set the game's starting timestamp
         createdAt = Timestamp.wrap(uint64(block.timestamp));
@@ -86,8 +95,8 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
         // Set the game's index in the factory
         gameIndex = DISPUTE_GAME_FACTORY.gameCount();
 
-        // Initialize contenderList
-        contenderList.push(0);
+        // Read respected status
+        wasRespectedGameTypeWhenCreated = OPTIMISM_PORTAL.respectedGameType().raw() == GAME_TYPE.raw();
     }
 
     // ------------------------------
@@ -112,11 +121,11 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
     /// @notice The proposals extending this proposal
     KailuaTournament[] public children;
 
-    /// @notice The position of the first surviving contender in contenderList
-    uint64 public contenderListIndex;
+    /// @notice The first surviving contender
+    uint64 public contenderIndex;
 
-    /// @notice Duplicate proposals of the last surviving contender proposal
-    uint64[] public contenderList;
+    /// @notice Duplicates of the last surviving contender proposal
+    uint64[] public contenderDuplicates;
 
     /// @notice The next unprocessed opponent
     uint64 public opponentIndex;
@@ -261,6 +270,9 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
         extraData_ = this.extraData();
     }
 
+    /// @notice True iff the Kailua GameType was respected by OptimismPortal at time of creation
+    bool public wasRespectedGameTypeWhenCreated;
+
     // ------------------------------
     // Tournament
     // ------------------------------
@@ -278,37 +290,16 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
         }
 
         // Resume from prior surviving contender
-        uint64 u = uint64(children.length);
-        for (uint64 listIndex = contenderListIndex; listIndex < contenderList.length; listIndex++) {
-            u = contenderList[listIndex];
-            if (!isChildEliminated(children[u])) {
-                // Found first survivor
-                // update storage
-                contenderListIndex = listIndex;
-                break;
-            }
-        }
-
+        uint64 u = contenderIndex;
         // Resume from prior unprocessed opponent
         uint64 v = opponentIndex;
-
-        // Advance contender & opponent pointers if no surviving contenders
-        if (u == children.length) {
-            // Note: this can point u to an eliminated contender
-            u = v++;
-            // Update storage to discard all eliminated contenders list
-            delete contenderList;
-            contenderList.push(u);
-            contenderListIndex = 0;
-        }
-
         // Abort if out of bounds
         if (u == children.length) {
             return KailuaTournament(address(0x0));
         }
-
         // Advance v if needed
-        if (v < u) {
+        if (v <= u) {
+            // INVARIANT: contenderDuplicates is empty
             v = u + 1;
         }
 
@@ -317,29 +308,35 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
         KailuaTournament contender = children[u];
         bytes32 contenderSignature = contender.signature();
 
-        // Note: u points to an uneliminated proposal in contenderList or to an eliminated solo proposal
         // If the contender is invalid then we eliminate it and find the next viable contender using the opponent
         // pointer. This search could terminate early if the elimination limit is reached.
-        // If the contender is valid and alive, this is skipped.
+        // If the contender is valid and its proposer is not eliminated, this is skipped.
         if (!isViableSignature(contenderSignature) || isChildEliminated(contender)) {
-            // Eliminate entire bad contender list
+            // INVARIANT: If branch entered through isChildEliminated condition, contenderDuplicates is empty
+
+            // Eliminate duplicates
             address payoutRecipient = getPayoutRecipient(contenderSignature);
-            for (
-                ;
-                contenderListIndex < contenderList.length && eliminationLimit > 0;
-                (contenderListIndex++, eliminationLimit--)
-            ) {
-                contender = children[contenderList[contenderListIndex]];
-                if (!isChildEliminated(contender)) {
-                    KAILUA_TREASURY.eliminate(address(contender), payoutRecipient);
+            for (uint256 i = contenderDuplicates.length; i > 0 && eliminationLimit > 0; (i--, eliminationLimit--)) {
+                KailuaTournament duplicate = children[contenderDuplicates[i - 1]];
+                if (!isChildEliminated(duplicate)) {
+                    KAILUA_TREASURY.eliminate(address(duplicate), payoutRecipient);
                 }
+                contenderDuplicates.pop();
             }
+
             // Abort if elimination allowance exhausted before eliminating all duplicate contenders
-            if (contenderListIndex < contenderList.length) {
+            if (eliminationLimit == 0) {
                 return KailuaTournament(address(0x0));
             }
 
-            // Select the next opponent as the next possible contender
+            // Eliminate contender
+            if (!isChildEliminated(contender)) {
+                KAILUA_TREASURY.eliminate(address(contender), payoutRecipient);
+            }
+            eliminationLimit--;
+
+            // Find next viable contender
+            // INVARIANT: v > max(u, contenderDuplicates);
             u = v;
             for (; u < children.length && eliminationLimit > 0; (u++, eliminationLimit--)) {
                 // Skip if previously eliminated
@@ -354,19 +351,17 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
                     KAILUA_TREASURY.eliminate(address(contender), getPayoutRecipient(contenderSignature));
                     continue;
                 }
-                // Select if viable
+                // Select u as next viable contender
                 break;
             }
-            // Push contender to list
-            delete contenderList;
-            contenderList.push(u);
-            contenderListIndex = 0;
+            // Store contender
+            contenderIndex = u;
             // Select the next possible opponent
             v = u + 1;
         }
 
         // Eliminate faulty opponents if we've landed on a viable contender
-        if (isViableSignature(contenderSignature)) {
+        if (u < children.length && isViableSignature(children[u].signature())) {
             // Iterate over opponents to eliminate them
             for (; v < children.length && eliminationLimit > 0; (v++, eliminationLimit--)) {
                 KailuaTournament opponent = children[v];
@@ -382,16 +377,16 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
                 // Append contender duplicate
                 bytes32 opponentSignature = opponent.signature();
                 if (opponentSignature == contenderSignature) {
-                    contenderList.push(v);
+                    contenderDuplicates.push(v);
                     continue;
                 }
                 // If there is insufficient proof data, abort
-                // Validity: The contender is the proven child, the opponent is incorrect
+                // Validity: The contender is the proven child, the opponent must be incorrect
                 // Fault: The contender is not proven faulty, the opponent may (not) be.
                 if (isViableSignature(opponentSignature)) {
                     revert NotProven();
                 }
-                // eliminate the opponent with the divergent proposal
+                // eliminate the opponent with the unviable proposal
                 KAILUA_TREASURY.eliminate(address(opponent), getPayoutRecipient(opponentSignature));
             }
 
@@ -506,11 +501,6 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
             revert AlreadyProven();
         }
 
-        // INVARIANT: Proofs can only show disparities
-        if (KailuaKZGLib.hashToFe(computedOutputHash) == proposedOutputFe) {
-            revert NoConflict();
-        }
-
         // INVARIANT: Proofs can only pertain to computed outputs
         if (co[1] >= PROPOSAL_OUTPUT_COUNT) {
             revert InvalidDisputedClaimIndex();
@@ -532,10 +522,12 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
             );
         }
 
-        // Validate the claimed output roots.
+        // Validate the claimed output root.
         if (co[1] == PROPOSAL_OUTPUT_COUNT - 1) {
-            // Note: proposedOutputFe must be a canonical point or comparison below will fail
-            require(proposedOutputFe == KailuaKZGLib.hashToFe(childContract.rootClaim().raw()), "bad proposedOutputFe");
+            // INVARIANT: Proofs can only show disparities
+            if (computedOutputHash == childContract.rootClaim().raw()) {
+                revert NoConflict();
+            }
         } else {
             // Note: proposedOutputFe must be a canonical point or point eval precompile call will fail
             // Prove divergent output publication
@@ -548,6 +540,10 @@ abstract contract KailuaTournament is Clone, IDisputeGame {
                 ),
                 "bad proposedOutput kzg"
             );
+            // INVARIANT: Proofs can only show disparities
+            if (KailuaKZGLib.hashToFe(computedOutputHash) == proposedOutputFe) {
+                revert NoConflict();
+            }
         }
 
         // Construct the expected journal

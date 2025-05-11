@@ -20,13 +20,14 @@ use anyhow::Context;
 use kailua_build::{KAILUA_FPVM_ELF, KAILUA_FPVM_ID};
 use kailua_client::await_tel;
 use kailua_client::telemetry::TelemetryArgs;
-use kailua_common::config::{config_hash, BN254_CONTROL_ID, CONTROL_ROOT, SET_BUILDER_ID};
+use kailua_common::config::{config_hash, BN254_CONTROL_ID, CONTROL_ROOT};
 use kailua_contracts::SystemConfig;
 use kailua_host::config::fetch_rollup_config;
 use opentelemetry::global::tracer;
 use opentelemetry::trace::{FutureExt, Status, TraceContextExt, Tracer};
 use risc0_zkvm::compute_image_id;
 use risc0_zkvm::sha::Digest;
+use tracing::debug;
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ConfigArgs {
@@ -56,21 +57,23 @@ pub async fn config(args: ConfigArgs) -> anyhow::Result<()> {
         fetch_rollup_config(&args.op_node_url, &args.op_geth_url, None)
     )
     .context("fetch_rollup_config")?;
+    debug!("{config:?}");
     let rollup_config_hash = config_hash(&config).expect("Configuration hash derivation error");
 
-    let eth_rpc_provider = ProviderBuilder::new().on_http(args.eth_rpc_url.as_str().try_into()?);
+    let eth_rpc_provider =
+        ProviderBuilder::new().connect_http(args.eth_rpc_url.as_str().try_into()?);
     // load system config
     let system_config = SystemConfig::new(config.l1_system_config_address, &eth_rpc_provider);
     let portal_address = system_config
         .optimismPortal()
         .stall_with_context(context.clone(), "SystemConfig::optimismPortal")
         .await
-        .addr_;
+        .0;
     let dgf_address = system_config
         .disputeGameFactory()
         .stall_with_context(context.clone(), "SystemConfig::disputeGameFactory")
         .await
-        .addr_;
+        .0;
 
     // report risc0 version
     println!("RISC0_VERSION: {}", risc0_zkvm::get_version()?);
@@ -92,11 +95,6 @@ pub async fn config(args: ConfigArgs) -> anyhow::Result<()> {
     println!(
         "CONTROL_ID: 0x{}",
         hex::encode_upper(BN254_CONTROL_ID.as_slice()),
-    );
-    // Report expected Boundless verifier parameters
-    println!(
-        "SET_BUILDER_ID: 0x{}",
-        hex::encode_upper(SET_BUILDER_ID.as_slice())
     );
     // report verifier address
     let verifier_address = match config.l1_chain_id {

@@ -1,9 +1,10 @@
 use crate::db::config::Config;
 use crate::db::fault::Fault;
-use crate::provider::{blob_fe_proof, blob_sidecar, get_block, BlobProvider};
 use crate::retry_with_context;
 use crate::stall::Stall;
-use crate::transact::Transact;
+use crate::transact::blob::{blob_fe_proof, blob_sidecar, BlobProvider};
+use crate::transact::rpc::get_block;
+use crate::transact::{Transact, TransactArgs};
 use alloy::consensus::{Blob, BlobTransactionSidecar, BlockHeader};
 use alloy::eips::eip4844::FIELD_ELEMENTS_PER_BLOB;
 use alloy::eips::BlockNumberOrTag;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::future::IntoFuture;
 use std::iter::repeat;
+use std::time::Duration;
 use tracing::{error, info};
 
 pub const ELIMINATIONS_LIMIT: u64 = 128;
@@ -82,7 +84,7 @@ pub struct Proposal {
 impl Proposal {
     pub async fn load<P: Provider<N>, N: Network>(
         blob_provider: &BlobProvider,
-        tournament_instance: &KailuaTournamentInstance<(), P, N>,
+        tournament_instance: &KailuaTournamentInstance<P, N>,
     ) -> anyhow::Result<Self> {
         let tracer = tracer("kailua");
         let context = opentelemetry::Context::current_with_span(tracer.start("Proposal::load"));
@@ -91,8 +93,7 @@ impl Proposal {
         let parent_address = tournament_instance
             .parentGame()
             .stall_with_context(context.clone(), "KailuaTournament::parentGame")
-            .await
-            .parentGame_;
+            .await;
         if parent_address == instance_address {
             info!("Loading KailuaTreasury instance");
             await_tel!(
@@ -115,7 +116,7 @@ impl Proposal {
     }
 
     async fn load_treasury<P: Provider<N>, N: Network>(
-        treasury_instance: &KailuaTreasuryInstance<(), P, N>,
+        treasury_instance: &KailuaTreasuryInstance<P, N>,
     ) -> anyhow::Result<Self> {
         let tracer = tracer("kailua");
         let context =
@@ -124,47 +125,36 @@ impl Proposal {
         let treasury = treasury_instance
             .KAILUA_TREASURY()
             .stall_with_context(context.clone(), "KailuaGame::KAILUA_TREASURY")
-            .await
-            ._0;
+            .await;
         let index = treasury_instance
             .gameIndex()
             .stall_with_context(context.clone(), "KailuaTreasury::gameIndex")
             .await
-            ._0
             .to();
         let created_at = treasury_instance
             .createdAt()
             .stall_with_context(context.clone(), "KailuaTreasury::createdAt")
-            .await
-            ._0;
+            .await;
         // claim data
         let output_root = treasury_instance
             .rootClaim()
             .stall_with_context(context.clone(), "KailuaTreasury::rootClaim")
             .await
-            .rootClaim_
             .0
             .into();
         let output_block_number = treasury_instance
             .l2BlockNumber()
             .stall_with_context(context.clone(), "KailuaTreasury::l2BlockNumber")
             .await
-            .l2BlockNumber_
             .to();
         let l1_head = treasury_instance
             .l1Head()
             .stall_with_context(context.clone(), "KailuaTreasury::l1Head")
-            .await
-            .l1Head_
-            .0
-            .into();
+            .await;
         let signature = treasury_instance
             .signature()
             .stall_with_context(context.clone(), "KailuaTreasury::signature")
-            .await
-            .signature_
-            .0
-            .into();
+            .await;
         Ok(Self {
             contract: *treasury_instance.address(),
             treasury,
@@ -191,7 +181,7 @@ impl Proposal {
 
     async fn load_game<P: Provider<N>, N: Network>(
         blob_provider: &BlobProvider,
-        game_instance: &KailuaGameInstance<(), P, N>,
+        game_instance: &KailuaGameInstance<P, N>,
     ) -> anyhow::Result<Self> {
         let tracer = tracer("kailua");
         let context =
@@ -200,29 +190,24 @@ impl Proposal {
         let treasury = game_instance
             .KAILUA_TREASURY()
             .stall_with_context(context.clone(), "KailuaGame::KAILUA_TREASURY")
-            .await
-            ._0;
+            .await;
         let index = game_instance
             .gameIndex()
             .stall_with_context(context.clone(), "KailuaGame::gameIndex")
             .await
-            ._0
             .to();
         let parent = game_instance
             .parentGameIndex()
             .stall_with_context(context.clone(), "KailuaGame::parentGameIndex")
-            .await
-            .parentGameIndex_;
+            .await;
         let proposer = game_instance
             .proposer()
             .stall_with_context(context.clone(), "KailuaGame::proposer")
-            .await
-            .proposer_;
+            .await;
         let created_at = game_instance
             .createdAt()
             .stall_with_context(context.clone(), "KailuaGame::createdAt")
-            .await
-            ._0;
+            .await;
         // fetch blob data
         let mut io_blobs = Vec::new();
         let mut io_field_elements = Vec::new();
@@ -231,20 +216,17 @@ impl Proposal {
             .PROPOSAL_BLOBS()
             .stall_with_context(context.clone(), "KailuaGame::PROPOSAL_BLOBS")
             .await
-            ._0
             .to();
         let proposal_output_count: u64 = game_instance
             .PROPOSAL_OUTPUT_COUNT()
             .stall_with_context(context.clone(), "KailuaGame::PROPOSAL_OUTPUT_COUNT")
             .await
-            ._0
             .to();
         for _ in 0..proposal_blobs {
             let blob_kzg_hash = game_instance
                 .proposalBlobHashes(U256::from(io_blobs.len()))
                 .stall_with_context(context.clone(), "KailuaGame::proposalBlobHashes")
-                .await
-                ._0;
+                .await;
             let blob_data = await_tel!(context, blob_provider.get_blob(created_at, blob_kzg_hash))
                 .context("get_blob")?;
             // save data
@@ -259,27 +241,23 @@ impl Proposal {
             .rootClaim()
             .stall_with_context(context.clone(), "KailuaGame::rootClaim")
             .await
-            .rootClaim_
             .0
             .into();
         let output_block_number: u64 = game_instance
             .l2BlockNumber()
             .stall_with_context(context.clone(), "KailuaGame::l2BlockNumber")
             .await
-            .l2BlockNumber_
             .to();
         let l1_head = game_instance
             .l1Head()
             .stall_with_context(context.clone(), "KailuaGame::l1Head")
             .await
-            .l1Head_
             .0
             .into();
         let signature = game_instance
             .signature()
             .stall_with_context(context.clone(), "KailuaGame::signature")
             .await
-            .signature_
             .0
             .into();
         let trail_len = trail_field_elements.len();
@@ -325,14 +303,12 @@ impl Proposal {
             .tournament_contract_instance(&provider)
             .parentGame()
             .stall_with_context(context.clone(), "KailuaTournament::parentGame")
-            .await
-            .parentGame_;
+            .await;
         let parent_tournament_instance = KailuaTournament::new(parent_tournament, &provider);
         let children = parent_tournament_instance
             .childCount()
             .stall_with_context(context.clone(), "KailuaTournament::childCount")
-            .await
-            .count_;
+            .await;
         let survivor = await_tel_res!(
             context,
             tracer,
@@ -341,8 +317,7 @@ impl Proposal {
                 .pruneChildren(children * U256::from(2))
                 .call()
                 .into_future()
-        )?
-        ._0;
+        )?;
         if survivor.is_zero() {
             Ok(None)
         } else {
@@ -385,8 +360,7 @@ impl Proposal {
             self.tournament_contract_instance(provider)
                 .status()
                 .stall_with_context(context.clone(), "KailuaTournament::status")
-                .await
-                ._0,
+                .await,
         )
     }
 
@@ -403,7 +377,6 @@ impl Proposal {
             .validChildSignature()
             .stall_with_context(context.clone(), "KailuaTournament::validChildSignature")
             .await
-            ._0
             .is_zero())
     }
 
@@ -424,8 +397,7 @@ impl Proposal {
             .tournament_contract_instance(provider)
             .getChallengerDuration(U256::from(chain_time))
             .stall_with_context(context.clone(), "KailuaTournament::getChallengerDuration")
-            .await
-            .duration_)
+            .await)
     }
 
     pub fn parse_finality(game_status: u8) -> anyhow::Result<Option<bool>> {
@@ -519,13 +491,14 @@ impl Proposal {
     pub fn tournament_contract_instance<P: Provider<N>, N: Network>(
         &self,
         provider: P,
-    ) -> KailuaTournamentInstance<(), P, N> {
+    ) -> KailuaTournamentInstance<P, N> {
         KailuaTournament::new(self.contract, provider)
     }
 
     pub async fn resolve<P: Provider<N>, N: Network>(
         &self,
         provider: P,
+        txn_args: &TransactArgs,
     ) -> anyhow::Result<N::ReceiptResponse> {
         let tracer = tracer("kailua");
         let context = opentelemetry::Context::current_with_span(tracer.start("Proposal::resolve"));
@@ -534,8 +507,7 @@ impl Proposal {
         let parent_tournament: Address = contract_instance
             .parentGame()
             .stall_with_context(context.clone(), "KailuaTournament::parentGame")
-            .await
-            .parentGame_;
+            .await;
         let parent_tournament_instance = KailuaTournament::new(parent_tournament, &provider);
 
         // Issue any necessary pre-emptive pruning calls
@@ -550,7 +522,7 @@ impl Proposal {
                     .call()
                     .into_future()
             )?
-            ._0;
+            .0;
 
             // If a survivor is returned we don't need pruning
             if !survivor.is_zero() {
@@ -560,7 +532,11 @@ impl Proposal {
             info!("Eliminating {ELIMINATIONS_LIMIT} opponents before resolution.");
             let receipt = parent_tournament_instance
                 .pruneChildren(U256::from(ELIMINATIONS_LIMIT))
-                .transact_with_context(context.clone(), "KailuaTournament::pruneChildren")
+                .timed_transact_with_context(
+                    context.clone(),
+                    "KailuaTournament::pruneChildren",
+                    Some(Duration::from_secs(txn_args.txn_timeout)),
+                )
                 .await
                 .context("KailuaTournament::pruneChildren")?;
             info!(
@@ -572,7 +548,11 @@ impl Proposal {
         // Issue resolution call
         let receipt = contract_instance
             .resolve()
-            .transact_with_context(context.clone(), "KailuaTournament::resolve")
+            .timed_transact_with_context(
+                context.clone(),
+                "KailuaTournament::resolve",
+                Some(Duration::from_secs(txn_args.txn_timeout)),
+            )
             .await
             .context("KailuaTournament::resolve")?;
         info!("KailuaTournament::resolve: {} gas", receipt.gas_used());
@@ -612,7 +592,7 @@ impl Proposal {
     }
 
     pub fn append_child(&mut self, child_index: u64) -> bool {
-        let should_insert = self.children.last().map_or(true, |i| i < &child_index);
+        let should_insert = self.children.last().is_none_or(|i| i < &child_index);
         // The assumption is that this is always sorted and out of order insertions are duplicates
         if should_insert {
             self.children.push(child_index);

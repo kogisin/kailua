@@ -62,13 +62,13 @@ pub fn create_proving_args(
             .map(|r| (r.block_ref.hash.to_string(), r.blob_hash.hash.to_string()))
             .unzip();
         let params = match precondition_data {
-            PreconditionValidationData::Validity(
-                global_l2_head_number,
+            PreconditionValidationData::Validity {
+                proposal_l2_head_number,
                 proposal_output_count,
                 output_block_span,
-                _,
-            ) => vec![
-                global_l2_head_number,
+                blob_hashes: _,
+            } => vec![
+                proposal_l2_head_number,
                 proposal_output_count,
                 output_block_span,
             ],
@@ -85,6 +85,10 @@ pub fn create_proving_args(
             String::from("--precondition-blob-hashes"),
             blob_hashes.join(","),
         ]);
+    }
+    // boundless args
+    if let Some(market) = &args.boundless.market {
+        proving_args.extend(market.to_arg_vec(&args.boundless.storage));
     }
     // data directory
     let data_dir = data_dir.join(format!(

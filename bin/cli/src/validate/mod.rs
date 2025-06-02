@@ -33,6 +33,7 @@ use alloy::providers::RootProvider;
 use anyhow::{anyhow, bail, Context};
 use kailua_build::KAILUA_FPVM_ID;
 use kailua_client::args::parse_address;
+use kailua_client::boundless::BoundlessArgs;
 use kailua_client::proof::{proof_file_name, read_proof_file};
 use kailua_client::provider::OpNodeProvider;
 use kailua_client::telemetry::TelemetryArgs;
@@ -41,7 +42,7 @@ use kailua_common::blobs::hash_to_fe;
 use kailua_common::blobs::BlobFetchRequest;
 use kailua_common::config::config_hash;
 use kailua_common::journal::ProofJournal;
-use kailua_common::precondition::{equivalence_precondition_hash, PreconditionValidationData};
+use kailua_common::precondition::{validity_precondition_hash, PreconditionValidationData};
 use kailua_contracts::*;
 use kailua_host::channel::AsyncChannel;
 use kailua_host::config::fetch_rollup_config;
@@ -87,6 +88,9 @@ pub struct ValidateArgs {
     /// Address of the KailuaGame implementation to use
     #[clap(long, env, value_parser = parse_address)]
     pub kailua_game_implementation: Option<Address>,
+
+    #[clap(flatten)]
+    pub boundless: BoundlessArgs,
 
     #[clap(flatten)]
     pub telemetry: TelemetryArgs,
@@ -681,7 +685,7 @@ pub async fn handle_proposals(
                 info!("Receipt validated.");
             }
             // Decode ProofJournal
-            let proof_journal = ProofJournal::decode_packed(receipt.journal.as_ref())?;
+            let proof_journal = ProofJournal::decode_packed(receipt.journal.as_ref());
             info!("Proof journal: {:?}", proof_journal);
             // encode seal data
             let encoded_seal = Bytes::from(encode_seal(&receipt)?);
@@ -715,7 +719,7 @@ pub async fn handle_proposals(
                     } else {
                         info!("Blobs hash {} confirmed", contract_blobs_hash);
                     }
-                    let precondition_hash = equivalence_precondition_hash(
+                    let precondition_hash = validity_precondition_hash(
                         &parent.output_block_number,
                         &kailua_db.config.proposal_output_count,
                         &kailua_db.config.output_block_span,
@@ -1374,12 +1378,12 @@ async fn request_validity_proof(
             })
         }
         debug_assert!(!validated_blobs.is_empty());
-        Some(PreconditionValidationData::Validity(
-            parent.output_block_number,
-            config.proposal_output_count,
-            config.output_block_span,
-            validated_blobs,
-        ))
+        Some(PreconditionValidationData::Validity {
+            proposal_l2_head_number: parent.output_block_number,
+            proposal_output_count: config.proposal_output_count,
+            output_block_span: config.output_block_span,
+            blob_hashes: validated_blobs,
+        })
     } else {
         None
     };
